@@ -7,14 +7,20 @@
 #include <unistd.h>
 
 #include "connection_handler.h"
+#include "../monitoring/logger.h"
+#include "../monitoring/error_handler.h"
+#include "../monitoring/performance.h"
 
 #define BUFFER_SIZE 4096
 #define CLIENT_TIMEOUT_SECONDS 10
 
 void *handle_client(void *arg)
 {
-    int client_fd = *(int *)arg;
+    double start_time = performance_start();
 
+    logger_log("INFO", "Client connection handler started");
+
+    int client_fd = *(int *)arg;
     /*
      * The dynamically allocated socket descriptor
      * is no longer needed after copying it.
@@ -39,11 +45,8 @@ void *handle_client(void *arg)
             &timeout,
             sizeof(timeout)) < 0) {
 
-        perror("setsockopt");
-
-        close(client_fd);
-        return NULL;
-    }
+        report_error("NETWORK", "setsockopt failed");
+        }
 
     /*
      * Receive data from the client.
@@ -114,9 +117,20 @@ void *handle_client(void *arg)
         perror("send");
     }
 
-    close(client_fd);
+close(client_fd);
 
-    printf("[+] Client connection closed.\n");
+    double elapsed = performance_elapsed_ms(start_time);
+
+    if (elapsed >= 0.0) {
+        char message[128];
+
+        snprintf(message, sizeof(message),
+                 "Client handler completed in %.2f ms", elapsed);
+
+        logger_log("INFO", message);
+    }
+
+    logger_log("INFO", "Client connection closed");
 
     return NULL;
 }
