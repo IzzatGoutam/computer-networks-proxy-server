@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 #include "forwarder.h"
+#include "../security/cache.h"
 
 #define BUFFER_SIZE 4096
 #define SERVER_TIMEOUT_SECONDS 10
@@ -93,35 +94,70 @@ static int build_forward_request(const HttpRequest *request, char *output, size_
  * Forwards an HTTP request to the destination server
  * and sends the response back to the client.
  */
-int forward_http_request(const HttpRequest *request, const char *original_request, int client_fd) {
+int forward_http_request(const HttpRequest *request,
+                         const char *original_request,
+                         int client_fd)
+{
     int server_fd;
     char forward_request[8192];
     char buffer[BUFFER_SIZE];
     ssize_t bytes_received;
+    char cache_key[MAX_CACHE_KEY];
+    char cached_response[MAX_CACHE_DATA];
+    char response_capture[MAX_CACHE_DATA];
+    size_t captured_size = 0;
+    int cacheable = 0;
 
-    (void)original_request; // unused
+    (void)original_request;
 
-    if (request == NULL) return -1;
+    if (request == NULL)
+        return -1;
 
-    printf("[FORWARD] Connecting to %s:%d\n", request->host, request->port);
+    /* Cache GET requests only. */
+    if (strcmp(request->method, "GET") == 0) {
+        int key_length = snprintf(cache_key, sizeof(cache_key),
+                                  "%s:%d%s",
+                                  request->host, request->port,
+                                  request->path);
+
+        if (key_length >= 0 &&
+            (size_t)key_length < sizeof(cache_key)) {
+            int cached_size = cache_get(cache_key, cached_response,
+                                        sizeof(cached_response));
+
+            if (cached_size > 0) {
+                printf("[CACHE] Serving cached response.\n");
+                return send_all(client_fd, cached_response,
+                                (size_t)cached_size);
+            }
+
+            cacheable = 1;
+        }
+    }
+
+    printf("[FORWARD] Connecting to %s:%d\n",
+           request->host, request->port);
 
     server_fd = connect_to_server(request->host, request->port);
     if (server_fd < 0) {
-        fprintf(stderr, "[FORWARD] Could not connect to %s:%d\n", request->host, request->port);
+        fprintf(stderr, "[FORWARD] Could not connect to %s:%d\n",
+                request->host, request->port);
         return -1;
     }
 
     struct timeval timeout;
-    timeout.tv_sec  = SERVER_TIMEOUT_SECONDS;
+    timeout.tv_sec = SERVER_TIMEOUT_SECONDS;
     timeout.tv_usec = 0;
 
-    if (setsockopt(server_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0) {
+    if (setsockopt(server_fd, SOL_SOCKET, SO_RCVTIMEO,
+                   &timeout, sizeof(timeout)) < 0) {
         perror("setsockopt");
         close(server_fd);
         return -1;
     }
 
-    if (build_forward_request(request, forward_request, sizeof(forward_request)) < 0) {
+    if (build_forward_request(request, forward_request,
+                              sizeof(forward_request)) < 0) {
         fprintf(stderr, "[FORWARD] Request too large.\n");
         close(server_fd);
         return -1;
@@ -129,32 +165,69 @@ int forward_http_request(const HttpRequest *request, const char *original_reques
 
     printf("[FORWARD] Sending request:\n%s", forward_request);
 
-    if (send_all(server_fd, forward_request, strlen(forward_request)) < 0) {
+    if (send_all(server_fd, forward_request,
+                 strlen(forward_request)) < 0) {
         close(server_fd);
         return -1;
     }
 
     while (1) {
         bytes_received = recv(server_fd, buffer, sizeof(buffer), 0);
+
         if (bytes_received < 0) {
-            if (errno == EINTR) continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            if (errno == EINTR)
+                continue;
+
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
                 fprintf(stderr, "[FORWARD] Server receive timeout.\n");
-            } else {
+            else
                 perror("recv");
-            }
+
             close(server_fd);
             return -1;
         }
-        if (bytes_received == 0) break; // server closed connection
 
-        if (send_all(client_fd, buffer, (size_t)bytes_received) < 0) {
+        if (bytes_received == 0)
+            break;
+
+        if (cacheable) {
+            size_t chunk_size = (size_t)bytes_received;
+
+            /* Reserve one byte for a terminating NUL. */
+            if (captured_size + chunk_size < sizeof(response_capture)) {
+                memcpy(response_capture + captured_size,
+                       buffer, chunk_size);
+                captured_size += chunk_size;
+            } else {
+                cacheable = 0;
+                captured_size = 0;
+            }
+        }
+
+        if (send_all(client_fd, buffer,
+                     (size_t)bytes_received) < 0) {
             close(server_fd);
             return -1;
         }
     }
 
     close(server_fd);
+
+    /* Cache complete successful responses only. */
+    if (cacheable && captured_size > 0) {
+        int status_code = 0;
+        response_capture[captured_size] = '\0';
+
+        if (sscanf(response_capture, "HTTP/%*s %d",
+                   &status_code) == 1 &&
+            status_code >= 200 && status_code < 300) {
+            if (cache_put(cache_key, response_capture,
+                          captured_size) == 0) {
+                printf("[CACHE] Successful response stored.\n");
+            }
+        }
+    }
+
     printf("[FORWARD] Response successfully sent to client.\n");
     return 0;
 }
