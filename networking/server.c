@@ -10,6 +10,9 @@
 #include <unistd.h>
 
 #include "connection_handler.h"
+#include "../security/access_control.h"
+#include "../security/cache.h"
+#include "../monitoring/logger.h"
 
 #define SERVER_HOST "127.0.0.1"
 #define SERVER_PORT 8888
@@ -103,6 +106,15 @@ int main(void)
         return EXIT_FAILURE;
     }
 
+    logger_init("proxy.log");
+    access_control_init();
+    cache_init();
+
+    /* Demo-only rule for testing access control. */
+    if (block_host("blocked.example") != 0) {
+        logger_log("ERROR", "Could not configure demo block rule");
+    }
+
     printf("========================================\n");
     printf("      HTTP Proxy Server - Stage 1\n");
     printf("      Listening on %s:%d\n", SERVER_HOST, SERVER_PORT);
@@ -185,6 +197,8 @@ int main(void)
     }
 
     close(server_fd);
+    logger_log("INFO", "Server stopped");
+    logger_close();
 
     printf("\nServer stopped.\n");
 
